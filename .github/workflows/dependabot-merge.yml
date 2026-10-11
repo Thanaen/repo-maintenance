@@ -1,0 +1,90 @@
+# Every 30 minutes: merges the open Dependabot PRs, in every repo the bot App is
+# installed on, whose head commit Pullfrog approved and whose checks all passed.
+# See the README.
+name: Dependabot merge
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: List the PRs that would be merged without merging them
+        type: boolean
+        default: false
+  pull_request:
+    paths: [.github/workflows/dependabot-merge.yml]
+
+permissions: {}
+
+env:
+  DRY_RUN: ${{ github.event_name == 'pull_request' || inputs.dry-run == true }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+
+defaults:
+  run:
+    # `shell: bash` alone runs with -eo pipefail, without -u.
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  merge:
+    # Dependabot-triggered runs receive no Actions secrets.
+    if: github.event_name != 'pull_request' || github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions: {}
+    steps:
+      - id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.BOT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      # Never GitHub auto-merge: on repos that require no approval it would
+      # merge before Pullfrog reviews. Merging a PR whose checks are still
+      # running is left to the next run.
+      - name: Merge approved Dependabot PRs
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          failed=0
+          repos=$(gh api --paginate installation/repositories \
+            --jq '.repositories[] | select(.archived | not) | .full_name')
+          while read -r repo; do
+            [[ -n $repo ]] || continue
+            prs=$(gh api --paginate "repos/$repo/pulls?state=open" \
+              --jq '.[] | select(.user.login == "dependabot[bot]" and (.draft | not)) | "\(.number) \(.head.sha) \(.html_url)"')
+            while read -r number sha url; do
+              [[ -n $number ]] || continue
+              review=$(gh api --paginate "repos/$repo/pulls/$number/reviews" \
+                | jq -rs --arg sha "$sha" 'add // [] | map(select(.user.login == "pullfrog[bot]" and .commit_id == $sha)) | last | .state // empty')
+              if [[ $review != APPROVED ]]; then
+                echo "Waiting for Pullfrog approval: $url"
+                continue
+              fi
+              # clean: mergeable and every check passed. unstable means a
+              # check failed or is still running; unknown means GitHub has not
+              # computed it yet. Either way the next run looks again.
+              state=$(gh api "repos/$repo/pulls/$number" --jq .mergeable_state)
+              if [[ $state != clean ]]; then
+                echo "Not ready ($state): $url"
+                continue
+              fi
+              if [[ $DRY_RUN == true ]]; then
+                echo "Would merge: $url" | tee -a "$GITHUB_STEP_SUMMARY"
+                continue
+              fi
+              if out=$(gh pr merge "$number" --repo "$repo" --merge --match-head-commit "$sha" 2>&1); then
+                echo "Merged: $url" | tee -a "$GITHUB_STEP_SUMMARY"
+              else
+                echo "::error::could not merge $url: ${out//$'\n'/ }"
+                failed=1
+              fi
+            done <<< "$prs"
+          done <<< "$repos"
+          exit "$failed"
