@@ -1,0 +1,357 @@
+# Monthly: refreshes the agent skills vendored with the `skills` CLI in every
+# repo the bot App is installed on, commits through the API so GitHub signs the
+# commit, opens a PR and merges it once Pullfrog approves. See the README.
+name: Skills update
+
+on:
+  schedule:
+    - cron: "0 4 1 * *"
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Create and verify the signed commit without moving a branch
+        type: boolean
+        default: false
+  pull_request:
+    paths: [.github/workflows/skills-update.yml, skills-cli/**]
+
+permissions: {}
+
+env:
+  DRY_RUN: ${{ github.event_name == 'pull_request' || inputs.dry-run == true }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    # `shell: bash` alone runs with -eo pipefail, without -u.
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  discover:
+    # Dependabot-triggered runs receive no Actions secrets.
+    if: github.event_name != 'pull_request' || github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      repos: ${{ steps.list.outputs.repos }}
+    steps:
+      - id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.BOT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: read
+
+      - id: list
+        name: List repos with a skills-lock.json
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          installed=$(gh api --paginate installation/repositories \
+            --jq '.repositories[] | select(.archived | not) | "\(.name) \(.default_branch)"')
+          found=$RUNNER_TEMP/repos.jsonl
+          : > "$found"
+          while read -r repo base; do
+            if out=$(gh api "repos/$GITHUB_REPOSITORY_OWNER/$repo/contents/skills-lock.json?ref=$base" --jq .path 2>&1); then
+              jq -nc --arg repo "$repo" --arg base "$base" '{repo: $repo, base: $base}' >> "$found"
+            elif [[ $out != *'(HTTP 404)'* ]]; then
+              echo "::error::$repo: ${out//$'\n'/ }"
+              exit 1
+            fi
+          done <<< "$installed"
+          repos=$(jq -sc . "$found")
+          echo "repos=$repos" >> "$GITHUB_OUTPUT"
+          echo "Repos to update: $(jq -r 'map("\(.repo) (\(.base))") | join(", ") | if . == "" then "none" else . end' <<< "$repos")" >> "$GITHUB_STEP_SUMMARY"
+
+  update:
+    needs: discover
+    # An empty matrix is an error.
+    if: needs.discover.outputs.repos != '[]'
+    name: Update ${{ matrix.repo }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.discover.outputs.repos) }}
+    env:
+      REPO: ${{ github.repository_owner }}/${{ matrix.repo }}
+      BASE: ${{ matrix.base }}
+    defaults:
+      run:
+        working-directory: repo
+    steps:
+      - id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.BOT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ matrix.repo }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.REPO }}
+          ref: ${{ matrix.base }}
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
+          path: repo
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: skills-cli
+          persist-credentials: false
+          path: ci
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      # Runs third-party code, so the App token stays out of this step. The
+      # read-only GITHUB_TOKEN only spares the CLI anonymous API rate limits.
+      - id: update
+        name: Update skills
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          DO_NOT_TRACK: "1"
+        run: |
+          fail() { echo "::error::$1"; echo "Failed: $1" >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+
+          # The lockfile keeps a new release of the CLI or of its dependencies
+          # out of this job, which holds the App key, until Dependabot bumps it.
+          # Installed outside the checkout: npx inside it resolves the repo's
+          # package.json, which fails on some repos (EOVERRIDE).
+          npm ci --prefix "$GITHUB_WORKSPACE/ci/skills-cli" --ignore-scripts --no-audit --no-fund
+          skills=$GITHUB_WORKSPACE/ci/skills-cli/node_modules/.bin/skills
+
+          # The CLI updates every agent whose directory root exists, and an
+          # app's data/ is the root of AstrBot's data/skills. It runs in a
+          # directory that holds only the lockfile and the two skill dirs.
+          work=$RUNNER_TEMP/skills
+          mkdir -p .claude/skills .agents/skills "$work/.claude" "$work/.agents"
+          mv -- skills-lock.json "$work/"
+          mv -- .claude/skills "$work/.claude/"
+          mv -- .agents/skills "$work/.agents/"
+          log=$RUNNER_TEMP/skills-update.log
+          status=0
+          (cd "$work" && "$skills" update -p -y) 2>&1 | tee "$log" || status=$?
+          mv -- "$work/skills-lock.json" .
+          mv -- "$work/.claude/skills" .claude/
+          mv -- "$work/.agents/skills" .agents/
+          if grep -qF -e 'No project skills can be updated in place' -e 'installed before skillPath tracking' "$log"; then
+            fail "some skills cannot be updated in place. Reinstall each with \`skills add <source> -s <skill>... -a claude-code -a codex --copy -y\` (prefix a domain source such as evlog.dev with https://)."
+          fi
+          (( status == 0 )) || fail "skills update exited with status $status"
+
+          # The CLI reinstalls with symlinks; developers are on Windows.
+          mapfile -d '' links < <(find .claude/skills .agents/skills -type l -print0)
+          for link in "${links[@]}"; do
+            target=$(readlink -f -- "$link")
+            [[ $target == "$PWD"/* ]] || fail "$link points outside the repo: $target"
+            rm -- "$link"
+            cp -RL -- "$target" "$link"
+          done
+
+          while IFS= read -r skill; do
+            agents=.agents/skills/$skill
+            claude=.claude/skills/$skill
+            if [[ -e $agents && -e $claude ]]; then
+              diff -rq -- "$agents" "$claude" || fail "$skill differs between .agents/skills and .claude/skills"
+            elif [[ -e $agents ]]; then
+              cp -R -- "$agents" "$claude"
+            elif [[ -e $claude ]]; then
+              cp -R -- "$claude" "$agents"
+            fi
+          done < <(jq -r '.skills | keys[]' skills-lock.json)
+
+          git add -A -- skills-lock.json .agents/skills .claude/skills
+
+          # Files the CLI downloads instead of cloning (vercel and vercel-labs
+          # sources) lose their mode; keep the executable bit the repo had.
+          while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
+            if [[ $meta == ':100755 100644 '* ]]; then
+              chmod +x -- "$path"
+              git update-index --chmod=+x -- "$path"
+            fi
+          done < <(git diff --cached --raw --no-renames --no-abbrev -z)
+
+          if git diff --cached --quiet; then
+            echo "Up to date." >> "$GITHUB_STEP_SUMMARY"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git diff --cached --stat
+          staged_links=$(git diff --cached --raw --no-renames | awk '$2 == "120000"')
+          [[ -z $staged_links ]] || fail "symlinks staged: ${staged_links//$'\n'/; }"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Write the PR body
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          git show HEAD:skills-lock.json > "$RUNNER_TEMP/skills-lock.base.json"
+          rows=$(jq -rn --slurpfile old "$RUNNER_TEMP/skills-lock.base.json" --slurpfile new skills-lock.json '
+            $old[0].skills as $o | $new[0].skills as $n
+            | ($o + $n | keys[]) as $k
+            | (if $o[$k] == null then "added"
+               elif $n[$k] == null then "removed"
+               elif $o[$k].computedHash != $n[$k].computedHash then "updated"
+               else empty end) as $change
+            | ($n[$k] // $o[$k]) as $e
+            | "| \($k) | \($e.source) | \($e.ref // "latest") | \($change) |"')
+          body=$RUNNER_TEMP/pr-body.md
+          {
+            cat << 'EOF'
+          Skills updated by the `skills` CLI in copy mode for Claude Code and Codex.
+
+          | Skill | Source | Ref | Change |
+          | --- | --- | --- | --- |
+          EOF
+            if [[ -n $rows ]]; then
+              echo "$rows"
+            else
+              cat << 'EOF'
+          | _(none)_ | | | |
+
+          No skill hash changed in `skills-lock.json`: the diff only refreshes the installed copies.
+          EOF
+            fi
+            cat << 'EOF'
+
+          > **Note for Pullfrog:** the skill files in this PR are third-party content vendored verbatim by the `skills` CLI. Do not review or judge their content. Only check that the diff is limited to `skills-lock.json`, `.agents/skills/` and `.claude/skills/`.
+
+          EOF
+            echo "Opened by the [Skills update workflow]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)."
+          } > "$body"
+          cat "$body" >> "$GITHUB_STEP_SUMMARY"
+
+      # Git Database API rather than createCommitOnBranch: tree entries carry
+      # file modes, and skill scripts are executable. GitHub signs the commit
+      # only without author, committer and signature fields.
+      - id: commit
+        name: Commit through the API
+        if: steps.update.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          fail() { echo "::error::$1"; echo "Failed: $1" >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+
+          base=$(git rev-parse HEAD)
+          base_tree=$(git rev-parse 'HEAD^{tree}')
+          expected=$(git write-tree)
+          entries=$RUNNER_TEMP/tree-entries.jsonl
+          : > "$entries"
+          declare -A uploaded=()
+          while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
+            read -r _ mode _ sha status <<< "$meta"
+            if [[ $status == D ]]; then
+              jq -nc --arg path "$path" '{path: $path, mode: "100644", type: "blob", sha: null}' >> "$entries"
+              continue
+            fi
+            if [[ -z ${uploaded[$sha]:-} ]]; then
+              created=$(git cat-file blob "$sha" | base64 -w0 | jq -Rsc '{content: ., encoding: "base64"}' \
+                | gh api "repos/$REPO/git/blobs" --input - --jq .sha)
+              [[ $created == "$sha" ]] || fail "the API stored $path as blob $created, git staged $sha"
+              uploaded[$sha]=1
+            fi
+            jq -nc --arg path "$path" --arg mode "$mode" --arg sha "$sha" '{path: $path, mode: $mode, type: "blob", sha: $sha}' >> "$entries"
+          done < <(git diff --cached --raw --no-renames --no-abbrev -z)
+
+          tree=$(jq -sc --arg base_tree "$base_tree" '{base_tree: $base_tree, tree: .}' "$entries" \
+            | gh api "repos/$REPO/git/trees" --input - --jq .sha)
+          [[ $tree == "$expected" ]] || fail "API tree differs from the local tree: $tree, expected $expected"
+
+          commit=$(jq -nc --arg tree "$tree" --arg parent "$base" \
+            '{message: "chore(skills): update installed skills", tree: $tree, parents: [$parent]}' \
+            | gh api "repos/$REPO/git/commits" --input - --jq .sha)
+          verification=$(gh api "repos/$REPO/git/commits/$commit" --jq '"\(.verification.verified) \(.verification.reason)"')
+          read -r verified reason <<< "$verification"
+          [[ $verified == true ]] || fail "commit $commit is not verified: $reason"
+          echo "sha=$commit" >> "$GITHUB_OUTPUT"
+          if [[ $DRY_RUN == true ]]; then
+            # Unreferenced, the commit is invisible and gets garbage-collected.
+            echo "Dry run: commit $commit created and verified ($reason), no branch moved." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - id: publish
+        name: Push the branch and open the PR
+        if: steps.update.outputs.changed == 'true' && env.DRY_RUN != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          branch=chore/skills-update
+          if gh api "repos/$REPO/git/ref/heads/$branch" --silent 2> /dev/null; then
+            gh api -X PATCH "repos/$REPO/git/refs/heads/$branch" -f sha="$SHA" -F force=true --silent
+          else
+            gh api "repos/$REPO/git/refs" -f ref="refs/heads/$branch" -f sha="$SHA" --silent
+          fi
+
+          body=$RUNNER_TEMP/pr-body.md
+          pr=$(gh api "repos/$REPO/pulls?state=open&head=${REPO%%/*}:$branch" --jq '.[0] // empty | "\(.number) \(.html_url)"')
+          if [[ -n $pr ]]; then
+            read -r number url <<< "$pr"
+            jq -n --rawfile body "$body" '{body: $body}' | gh api -X PATCH "repos/$REPO/pulls/$number" --input - --silent
+            echo "PR updated: $url" >> "$GITHUB_STEP_SUMMARY"
+          else
+            pr=$(jq -n --rawfile body "$body" --arg head "$branch" --arg base "$BASE" \
+              '{title: "chore(skills): update installed skills", head: $head, base: $base, body: $body, draft: false}' \
+              | gh api "repos/$REPO/pulls" --input - --jq '"\(.number) \(.html_url)"')
+            read -r number url <<< "$pr"
+            echo "PR opened: $url" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      # Never GitHub auto-merge: on repos that require no approval it would
+      # merge before Pullfrog reviews.
+      - name: Merge once Pullfrog approves
+        if: steps.update.outputs.changed == 'true' && env.DRY_RUN != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SHA: ${{ steps.commit.outputs.sha }}
+          NUMBER: ${{ steps.publish.outputs.number }}
+          URL: ${{ steps.publish.outputs.url }}
+        run: |
+          fail() { echo "::error::$1"; echo "Failed: $1" >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+
+          deadline=$((SECONDS + 45 * 60))
+          last_error=
+          while :; do
+            review=$(gh api --paginate "repos/$REPO/pulls/$NUMBER/reviews" \
+              | jq -rs --arg sha "$SHA" 'add // [] | map(select(.user.login == "pullfrog[bot]" and .commit_id == $sha)) | last | .state // empty')
+            case $review in
+              APPROVED)
+                # Fails while required checks or deployments are still running.
+                # On a merge-queue branch it only enqueues the PR, so success
+                # is read from the PR itself below.
+                last_error=$(gh pr merge "$NUMBER" --repo "$REPO" --merge --match-head-commit "$SHA" 2>&1) || true
+                ;;
+              CHANGES_REQUESTED)
+                fail "Pullfrog requested changes on $URL"
+                ;;
+            esac
+            merged=$(gh api "repos/$REPO/pulls/$NUMBER" --jq .merged)
+            if [[ $merged == true ]]; then
+              # Some repos delete merged branches themselves.
+              out=$(gh api -X DELETE "repos/$REPO/git/refs/heads/chore/skills-update" 2>&1) \
+                || [[ $out == *'(HTTP 404)'* || $out == *'Reference does not exist'* ]] \
+                || fail "merged $URL but could not delete chore/skills-update: $out"
+              echo "Merged: $URL" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            (( SECONDS < deadline )) || break
+            sleep 60
+          done
+          if [[ -n $last_error ]]; then
+            fail "not merged within 45 minutes: $URL: ${last_error//$'\n'/ }"
+          fi
+          fail "no Pullfrog approval on $SHA within 45 minutes: $URL"

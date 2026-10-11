@@ -1,0 +1,17 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /skills-cli
+    schedule:
+      interval: monthly
+      time: "08:00"
+      timezone: Europe/Paris
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+      time: "08:00"
+      timezone: Europe/Paris
+    groups:
+      github-actions:
+        patterns: ["*"]

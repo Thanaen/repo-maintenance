@@ -1,0 +1,83 @@
+# Reusable: runs `bun dedupe` on a Dependabot PR and commits the rewritten
+# bun.lock to the PR branch. Callers own the trigger (bun.lock changes) and the
+# Dependabot gate; see the README for the caller snippet.
+name: Dependabot bun dedupe
+
+on:
+  workflow_call:
+    inputs:
+      bun-version:
+        description: Bun version to run (`bun dedupe` needs 1.4+).
+        type: string
+        required: false
+        default: latest
+    secrets:
+      app_client_id:
+        description: Client ID of the GitHub App that makes the dedupe commit
+        required: true
+      app_private_key:
+        description: Private key of that GitHub App
+        required: true
+
+jobs:
+  dedupe:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: bun-dedupe-${{ github.head_ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.head_ref }}
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ inputs.bun-version }}
+
+      # --lockfile-only installs nothing, so no dependency code runs in this job.
+      # dedupe never queries the registry either.
+      - run: bun dedupe --lockfile-only
+
+      - id: diff
+        run: git diff --quiet bun.lock || echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      # App token rather than GITHUB_TOKEN: a commit made with GITHUB_TOKEN does
+      # not trigger workflows, so the deduped commit would land without CI.
+      - id: app-token
+        if: steps.diff.outputs.changed == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.app_client_id }}
+          private-key: ${{ secrets.app_private_key }}
+          permission-contents: write
+
+      # createCommitOnBranch rather than git push: GitHub signs commits an App
+      # makes through the API, and rulesets requiring signed commits block
+      # unsigned ones from merging. expectedHeadOid rejects the commit if
+      # Dependabot pushed in the meantime; that push reruns the caller anyway.
+      # [dependabot skip] keeps Dependabot rebasing its PR: it force-pushes over
+      # this commit, and that push runs the caller again.
+      - name: Commit
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          base64 -w0 bun.lock > "$RUNNER_TEMP/bun.lock.b64"
+          jq -n \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg branch "$GITHUB_HEAD_REF" \
+            --arg head "$(git rev-parse HEAD)" \
+            --rawfile lock "$RUNNER_TEMP/bun.lock.b64" \
+            '{
+              query: "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { url } } }",
+              variables: {input: {
+                branch: {repositoryNameWithOwner: $repo, branchName: $branch},
+                expectedHeadOid: $head,
+                message: {headline: "chore(deps): bun dedupe [dependabot skip]"},
+                fileChanges: {additions: [{path: "bun.lock", contents: $lock}]}
+              }}
+            }' \
+            | gh api graphql --input - --jq '.data.createCommitOnBranch.commit.url'

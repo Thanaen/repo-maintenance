@@ -1,0 +1,8 @@
+{
+  "name": "skills-cli",
+  "private": true,
+  "description": "Pins the skills CLI used by the Skills update workflow. Dependabot bumps it.",
+  "dependencies": {
+    "skills": "1.7.2"
+  }
+}
